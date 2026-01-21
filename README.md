@@ -79,6 +79,8 @@ sudo systemctl start papermcp
 
 ## Available MCP Tools
 
+### Note Management Tools
+
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `create_note` | Create a new note | `content: str` |
@@ -87,13 +89,38 @@ sudo systemctl start papermcp
 | `append_bottom` | Add content at end | `filename, content` |
 | `replace_text` | Search and replace | `filename, search, replace` |
 | `update_full` | Overwrite entire note | `filename, content` |
+| `search_notes` | Search notes by content | `query, search_type` |
+| `list_notes` | List all notes | `category, limit` |
+| `list_categories` | List all categories | - |
+| `delete_note` | Delete a note (backup auto-created) | `filename` |
+
+### Paper Management Tools (for Research)
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `search_papers` | Search papers by title/memo/summary | `query` |
+| `list_papers` | List all papers | `category, limit` |
+| `get_paper` | Get paper details with memo/summary | `pdf_id` |
+| `get_paper_summary` | Get paper summary only | `pdf_id` |
 
 ## Example Commands in Claude.ai
 Once connected, you can use natural language:
+
+### Note Operations
 - "Create a new note about today's meeting"
 - "Show me the content of [_]20250121-123456.txt"
 - "Append 'Task completed' to the bottom of my note"
 - "Replace 'draft' with 'final' in the document"
+- "Search for notes about 'meeting'"
+- "List all my notes"
+- "Show me all categories"
+
+### Paper Operations (Research)
+- "Search for papers about 'machine learning'"
+- "List all my papers"
+- "Show me the details of this paper"
+- "What's the summary of paper X?"
+- "Compare papers A and B"
 
 ## Notes
 - Ensure `config.yaml` is properly configured before starting
@@ -185,6 +212,8 @@ sudo systemctl start papermcp
 
 ## 利用可能なMCPツール
 
+### ノート管理ツール
+
 | ツール | 説明 | パラメータ |
 |--------|------|-----------|
 | `create_note` | 新規ノート作成 | `content: str` |
@@ -193,13 +222,38 @@ sudo systemctl start papermcp
 | `append_bottom` | 末尾にコンテンツ追加 | `filename, content` |
 | `replace_text` | 検索と置換 | `filename, search, replace` |
 | `update_full` | ノート全体を上書き | `filename, content` |
+| `search_notes` | ノートを検索 | `query, search_type` |
+| `list_notes` | ノート一覧取得 | `category, limit` |
+| `list_categories` | カテゴリ一覧取得 | - |
+| `delete_note` | ノート削除（バックアップ自動作成） | `filename` |
+
+### 論文管理ツール（研究用）
+
+| ツール | 説明 | パラメータ |
+|--------|------|-----------|
+| `search_papers` | タイトル/メモ/サマリーで論文検索 | `query` |
+| `list_papers` | 論文一覧取得 | `category, limit` |
+| `get_paper` | 論文詳細取得（メモ/サマリー含む） | `pdf_id` |
+| `get_paper_summary` | 論文サマリーのみ取得 | `pdf_id` |
 
 ## Claude.aiでの使用例
 接続後、自然言語で指示できます:
+
+### ノート操作
 - 「今日の会議についてのノートを作成して」
 - 「[_]20250121-123456.txtの内容を見せて」
 - 「ノートの末尾に『タスク完了』と追加して」
 - 「ドキュメント内の『下書き』を『最終版』に置き換えて」
+- 「会議についてのノートを検索して」
+- 「ノート一覧を見せて」
+- 「カテゴリ一覧を表示して」
+
+### 論文操作（研究）
+- 「機械学習に関する論文を検索して」
+- 「論文一覧を見せて」
+- 「この論文の詳細を見せて」
+- 「論文Xのサマリーを教えて」
+- 「論文AとBを比較して」
 
 ## 注意点
 - 起動前に`config.yaml`が正しく設定されていることを確認してください

@@ -156,6 +156,104 @@ class PapernoteClient:
         response.raise_for_status()
         return {"filename": filename, "message": "Note updated successfully", "data": response.json()}
 
+    def search_notes(self, query: str, search_type: str = "all") -> dict:
+        """Search notes by content.
+
+        Args:
+            query: Search query string
+            search_type: 'title', 'body', or 'all' (default: 'all')
+
+        Returns:
+            Search results
+        """
+        url = f"{self.api_url}/search"
+        params = {"q": query, "type": search_type}
+        response = requests.get(url, params=params, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def list_notes(self) -> dict:
+        """List all notes.
+
+        Returns:
+            List of all notes
+        """
+        response = requests.get(self.api_url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def list_categories(self) -> dict:
+        """List all categories.
+
+        Returns:
+            List of all categories with counts
+        """
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/categories"
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def delete_note(self, filename: str) -> dict:
+        """Delete a note.
+
+        Args:
+            filename: The filename of the note to delete
+
+        Returns:
+            Deletion result
+        """
+        encoded_filename = quote(filename, safe='')
+        url = f"{self.api_url}/{encoded_filename}"
+        response = requests.delete(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    # --- Paper関連メソッド ---
+
+    def search_papers(self, query: str) -> dict:
+        """Search papers.
+
+        Args:
+            query: Search query string
+
+        Returns:
+            Search results
+        """
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/papers/search"
+        params = {"q": query}
+        response = requests.get(url, params=params, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def list_papers(self) -> dict:
+        """List all papers.
+
+        Returns:
+            List of all papers
+        """
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/papers"
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def get_paper(self, pdf_id: str) -> dict:
+        """Get paper details.
+
+        Args:
+            pdf_id: The paper ID (filename without .pdf)
+
+        Returns:
+            Paper details including memo and summaries
+        """
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/papers/{pdf_id}"
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
 
 def register_tools(mcp, config: dict):
     """Register Papernote tools with the MCP server.
@@ -272,3 +370,191 @@ def register_tools(mcp, config: dict):
             return f"Updated note: {result['filename']}"
         except requests.exceptions.RequestException as e:
             return f"Error updating note: {str(e)}"
+
+    # --- Phase 1: 検索・一覧ツール ---
+
+    @mcp.tool()
+    def search_notes(query: str, search_type: str = "all") -> str:
+        """Search notes by content.
+
+        Args:
+            query: Search query string
+            search_type: 'title', 'body', or 'all' (default: 'all')
+
+        Returns:
+            List of matching notes
+        """
+        try:
+            result = client.search_notes(query, search_type)
+            posts = result.get("data", {}).get("posts", [])
+            if not posts:
+                return f"No notes found for '{query}'"
+            output = [f"Found {len(posts)} notes:"]
+            for p in posts[:20]:
+                output.append(f"- {p['filename']}: {p['title']}")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error searching notes: {str(e)}"
+
+    @mcp.tool()
+    def list_notes(category: str = None, limit: int = 20) -> str:
+        """List all notes.
+
+        Args:
+            category: Optional category filter
+            limit: Maximum notes to return (default: 20)
+
+        Returns:
+            List of notes
+        """
+        try:
+            result = client.list_notes()
+            posts = result.get("data", {}).get("posts", [])
+            if category:
+                posts = [p for p in posts if p.get("category") == category]
+            posts = posts[:limit]
+            output = [f"Notes ({len(posts)}):"]
+            for p in posts:
+                output.append(f"- {p['filename']}: {p['title']}")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error listing notes: {str(e)}"
+
+    # --- Phase 2: 利便性向上ツール ---
+
+    @mcp.tool()
+    def list_categories() -> str:
+        """List all note categories with counts.
+
+        Returns:
+            List of categories with note counts
+        """
+        try:
+            result = client.list_categories()
+            cats = result.get("data", {}).get("categories", [])
+            output = ["Categories:"]
+            for c in cats:
+                output.append(f"- {c['category']}: {c['count']} notes")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error listing categories: {str(e)}"
+
+    @mcp.tool()
+    def delete_note(filename: str) -> str:
+        """Delete a note (backup created automatically).
+
+        Args:
+            filename: The filename of the note to delete
+
+        Returns:
+            Deletion status message
+        """
+        try:
+            client.delete_note(filename)
+            return f"Deleted: {filename}"
+        except requests.exceptions.RequestException as e:
+            return f"Error deleting note: {str(e)}"
+
+    # --- Phase 3: Paper関連ツール（研究議論用） ---
+
+    @mcp.tool()
+    def search_papers(query: str) -> str:
+        """Search papers by title, memo, and summary content.
+
+        Args:
+            query: Search query (supports multiple terms)
+
+        Returns:
+            List of matching papers
+        """
+        try:
+            result = client.search_papers(query)
+            papers = result.get("data", {}).get("results", [])
+            if not papers:
+                return f"No papers found for '{query}'"
+            output = [f"Found {len(papers)} papers:"]
+            for p in papers[:20]:
+                output.append(f"- [{p['pdf_id']}] {p['title']} ({p.get('category', 'N/A')})")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error searching papers: {str(e)}"
+
+    @mcp.tool()
+    def list_papers(category: str = None, limit: int = 20) -> str:
+        """List all papers.
+
+        Args:
+            category: Optional category filter
+            limit: Maximum papers to return (default: 20)
+
+        Returns:
+            List of papers
+        """
+        try:
+            result = client.list_papers()
+            papers = result.get("data", {}).get("papers", [])
+            if category:
+                papers = [p for p in papers if p.get("category") == category]
+            papers = papers[:limit]
+            output = [f"Papers ({len(papers)}):"]
+            for p in papers:
+                flags = []
+                if p.get("has_memo"):
+                    flags.append("memo")
+                if p.get("has_summary"):
+                    flags.append("summary")
+                flag_str = f" [{','.join(flags)}]" if flags else ""
+                output.append(f"- [{p['pdf_id']}] {p['title']}{flag_str}")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error listing papers: {str(e)}"
+
+    @mcp.tool()
+    def get_paper(pdf_id: str) -> str:
+        """Get paper details including memo and summaries.
+
+        Args:
+            pdf_id: The paper ID (filename without .pdf)
+
+        Returns:
+            Paper details with memo and summaries
+        """
+        try:
+            result = client.get_paper(pdf_id)
+            data = result.get("data", {})
+            output = [
+                f"# {data.get('title', pdf_id)}",
+                f"Category: {data.get('category', 'N/A')}",
+                f"Date: {data.get('date', 'N/A')}",
+                "",
+                "## Memo",
+                data.get("memo", "(No memo)") or "(No memo)",
+                "",
+                "## Summary",
+                data.get("summary", "(No summary)") or "(No summary)",
+            ]
+            if data.get("summary2"):
+                output.extend(["", "## Summary 2", data.get("summary2")])
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error getting paper: {str(e)}"
+
+    @mcp.tool()
+    def get_paper_summary(pdf_id: str) -> str:
+        """Get paper summary only (for quick research discussions).
+
+        Args:
+            pdf_id: The paper ID (filename without .pdf)
+
+        Returns:
+            Paper title and summary
+        """
+        try:
+            result = client.get_paper(pdf_id)
+            data = result.get("data", {})
+            summary = data.get("summary", "")
+            if not summary:
+                return f"No summary available for {pdf_id}"
+            return f"# {data.get('title', pdf_id)}\n\n{summary}"
+        except requests.exceptions.RequestException as e:
+            return f"Error getting paper summary: {str(e)}"
