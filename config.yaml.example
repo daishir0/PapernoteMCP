@@ -1,9 +1,9 @@
 server:
-  port: 5556
+  port: 8000
 
 # Papernote API設定
 papernote:
-  api_url: "https://paper.path-finder.jp/api/posts"
+  api_url: "https://your-papernote-server.example.com/api/posts"
   api_key: "YOUR_PAPERNOTE_API_KEY_HERE"
 
 # OAuth認証設定（初回起動時に自動生成される場合はコメントアウト可）

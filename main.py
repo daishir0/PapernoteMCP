@@ -11,7 +11,7 @@ with open(config_path, "r", encoding="utf-8") as f:
 
 # Get server configuration
 server_config = config.get("server", {})
-port = server_config.get("port", 5556)
+port = server_config.get("port", 8000)
 
 # Create MCP server with host/port settings
 mcp = FastMCP(

@@ -31,7 +31,7 @@ Papernote MCP Server is a Model Context Protocol (MCP) server that enables Claud
    cp config.yaml.example config.yaml
    ```
 5. Edit `config.yaml` with your settings:
-   - `server.port`: Server port (default: 5556)
+   - `server.port`: Server port (default: 8000)
    - `papernote.api_url`: Your Papernote API endpoint
    - `papernote.api_key`: Your Papernote API key
    - `oauth.client_id`: OAuth Client ID for MCP authentication
@@ -42,7 +42,7 @@ Papernote MCP Server is a Model Context Protocol (MCP) server that enables Claud
 ```bash
 python main.py
 ```
-The server will start on `http://127.0.0.1:5556` with SSE transport.
+The server will start on `http://127.0.0.1:8000` with SSE transport (port configurable in config.yaml).
 
 ### Production Deployment (systemd)
 Create a systemd service file at `/etc/systemd/system/papermcp.service`:
@@ -137,7 +137,7 @@ Papernote MCP Serverは、Claude.ai WebがPapernote（クラウドベースの�
    cp config.yaml.example config.yaml
    ```
 5. `config.yaml`を編集:
-   - `server.port`: サーバーポート（デフォルト: 5556）
+   - `server.port`: サーバーポート（デフォルト: 8000）
    - `papernote.api_url`: Papernote APIのエンドポイント
    - `papernote.api_key`: Papernote APIキー
    - `oauth.client_id`: MCP認証用OAuth Client ID
@@ -148,7 +148,7 @@ Papernote MCP Serverは、Claude.ai WebがPapernote（クラウドベースの�
 ```bash
 python main.py
 ```
-サーバーは`http://127.0.0.1:5556`でSSEトランスポートで起動します。
+サーバーは`http://127.0.0.1:8000`でSSEトランスポートで起動します（ポートはconfig.yamlで変更可能）。
 
 ### 本番環境へのデプロイ（systemd）
 `/etc/systemd/system/papermcp.service`にsystemdサービスファイルを作成:
