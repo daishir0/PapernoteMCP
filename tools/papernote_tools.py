@@ -35,6 +35,14 @@ class PapernoteClient:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"[_]{timestamp}.txt"
 
+        # 1行目が##で始まらない場合は##を付与（非公開にする）
+        first_line = content.split("\n")[0] if content else ""
+        if not first_line.startswith("##"):
+            if first_line.startswith("#"):
+                content = "#" + content
+            else:
+                content = "##" + content
+
         # Add header lines (title and date)
         title = content.split("\n")[0][:50] if content else "New Note"
         date_line = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
