@@ -35,18 +35,41 @@ class PapernoteClient:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"[_]{timestamp}.txt"
 
+        # 1行目の ## とタイトルの間のスペースを除去（## Title → ##Title）
+        lines = content.split("\n") if content else [""]
+        if lines[0].startswith("## "):
+            lines[0] = "##" + lines[0][3:]
+        content = "\n".join(lines)
+
         # 1行目が##で始まらない場合は##を付与（非公開にする）
-        first_line = content.split("\n")[0] if content else ""
+        first_line = lines[0]
         if not first_line.startswith("##"):
             if first_line.startswith("#"):
                 content = "#" + content
             else:
                 content = "##" + content
+            lines = content.split("\n")
 
-        # Add header lines (title and date)
-        title = content.split("\n")[0][:50] if content else "New Note"
-        date_line = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        full_content = f"{title}\n{date_line}\n\n{content}"
+        # # yyyymmdd 見出しの存在チェック・自動挿入
+        has_date_heading = any(
+            line.startswith("# ") and not line.startswith("##")
+            for line in lines
+        )
+        if not has_date_heading:
+            title_text = lines[0].lstrip("#").strip()
+            date_str = datetime.now().strftime("%Y%m%d")
+            date_heading = f"# {date_str}{title_text}"
+            # 1行目の後: 空行 → date_heading → 空行 → 残り本文
+            rest = lines[1:] if len(lines) > 1 else []
+            if rest and rest[0] == "":
+                rest = [rest[0], date_heading, ""] + rest[1:]
+            else:
+                rest = ["", date_heading, ""] + rest
+            lines = [lines[0]] + rest
+            content = "\n".join(lines)
+
+        # 正規化済みコンテンツをそのまま使用
+        full_content = content
 
         payload = {
             "filename": filename,
@@ -88,16 +111,12 @@ class PapernoteClient:
         # API returns {"data": {"content": "..."}, "status": "success"}
         current_content = current.get("data", {}).get("content", "")
 
-        # Split into lines
+        # title(1行目) + empty(2行目) の後に挿入
         lines = current_content.split("\n")
-
-        # Insert after line 2 (title and date)
-        if len(lines) >= 2:
-            new_lines = lines[:2] + [content] + lines[2:]
-        else:
-            new_lines = lines + [content]
-
-        new_content = "\n".join(new_lines)
+        title_line = lines[0] if len(lines) > 0 else ""
+        empty_line = lines[1] if len(lines) > 1 else ""
+        body = "\n".join(lines[2:]) if len(lines) > 2 else ""
+        new_content = f"{title_line}\n{empty_line}\n{content}\n\n{body}"
 
         return self.update_full(filename, new_content)
 
@@ -217,6 +236,26 @@ class PapernoteClient:
         response.raise_for_status()
         return response.json()
 
+    def upload_image(self, file_path: str) -> dict:
+        """Upload an image to Papernote.
+
+        Args:
+            file_path: Path to the image file to upload
+
+        Returns:
+            API response with markdown_url
+        """
+        import os
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/images"
+        ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        with open(file_path, 'rb') as f:
+            files = {'file': (os.path.basename(file_path), f, f'image/{ext}')}
+            response = requests.post(url, headers=headers, files=files)
+        response.raise_for_status()
+        return response.json()
+
     # --- Paper関連メソッド ---
 
     def search_papers(self, query: str) -> dict:
@@ -279,6 +318,21 @@ def register_tools(mcp, config: dict):
     @mcp.tool()
     def create_note(content: str) -> str:
         """Create a new note in Papernote.
+
+        Content format (auto-corrected if not followed):
+          Line 1: ##Title (no space between ## and title)
+          Line 2: (empty)
+          Line 3: # yyyymmddTitle (single # date heading, unique in document)
+          Line 4: (empty)
+          Line 5+: Body text (section headers start with ##)
+
+        Example:
+          ##ハワイ旅行メモ
+
+          # 20260218旅行計画
+
+          ## 概要
+          - 出発日: 7月1日
 
         Args:
             content: The content of the note to create
@@ -462,6 +516,27 @@ def register_tools(mcp, config: dict):
             return f"Deleted: {filename}"
         except requests.exceptions.RequestException as e:
             return f"Error deleting note: {str(e)}"
+
+    @mcp.tool()
+    def upload_image(file_path: str, append_to: str = None) -> str:
+        """Upload an image to Papernote.
+
+        Args:
+            file_path: Path to the image file (jpg/png/gif/webp etc.)
+            append_to: Optional note filename to append the image markdown URL to
+
+        Returns:
+            Markdown URL of the uploaded image
+        """
+        try:
+            result = client.upload_image(file_path)
+            markdown_url = result.get("data", {}).get("markdown_url", "")
+            if append_to and markdown_url:
+                client.append_top(append_to, markdown_url)
+                return f"Uploaded and appended to {append_to}: {markdown_url}"
+            return f"Uploaded: {markdown_url}"
+        except Exception as e:
+            return f"Error uploading image: {str(e)}"
 
     # --- Phase 3: Paper関連ツール（研究議論用） ---
 
