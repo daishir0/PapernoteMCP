@@ -236,23 +236,47 @@ class PapernoteClient:
         response.raise_for_status()
         return response.json()
 
-    def upload_image(self, file_path: str) -> dict:
+    def upload_image(self, file_path: str = None, image_data: str = None, filename: str = "image.png") -> dict:
         """Upload an image to Papernote.
 
         Args:
-            file_path: Path to the image file to upload
+            file_path: Path to the image file (local MCP server only)
+            image_data: Base64-encoded image data (for remote Claude.ai usage)
+            filename: Filename to use when uploading via image_data
 
         Returns:
             API response with markdown_url
         """
         import os
+        import base64
+        import io
+
         base_url = self.api_url.replace("/posts", "")
         url = f"{base_url}/images"
-        ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        with open(file_path, 'rb') as f:
-            files = {'file': (os.path.basename(file_path), f, f'image/{ext}')}
+
+        if image_data:
+            # Base64文字列をデコードしてバイナリとして送信
+            # data:image/png;base64,... 形式にも対応
+            if "," in image_data:
+                header, data = image_data.split(",", 1)
+                mime_type = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
+                ext = mime_type.split("/")[-1]
+            else:
+                data = image_data
+                ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'png'
+                mime_type = f"image/{ext}"
+            binary_data = base64.b64decode(data)
+            files = {'file': (filename, io.BytesIO(binary_data), mime_type)}
             response = requests.post(url, headers=headers, files=files)
+        elif file_path:
+            ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
+            with open(file_path, 'rb') as f:
+                files = {'file': (os.path.basename(file_path), f, f'image/{ext}')}
+                response = requests.post(url, headers=headers, files=files)
+        else:
+            raise ValueError("Either file_path or image_data must be provided")
+
         response.raise_for_status()
         return response.json()
 
@@ -518,18 +542,39 @@ def register_tools(mcp, config: dict):
             return f"Error deleting note: {str(e)}"
 
     @mcp.tool()
-    def upload_image(file_path: str, append_to: str = None) -> str:
+    def upload_image(
+        file_path: str = None,
+        image_data: str = None,
+        filename: str = "image.png",
+        append_to: str = None
+    ) -> str:
         """Upload an image to Papernote.
+
+        Two modes depending on the environment:
+
+        Mode 1 - file_path (local MCP server only):
+          upload_image(file_path="/path/to/image.png")
+
+        Mode 2 - image_data (for Claude.ai Web / remote usage):
+          Read the image file, encode it as Base64, and pass the string.
+          Supports raw Base64 or data URI format (data:image/png;base64,...).
+          upload_image(image_data="iVBORw0KGgo...", filename="photo.png")
 
         Args:
             file_path: Path to the image file (jpg/png/gif/webp etc.)
+            image_data: Base64-encoded image data string
+            filename: Filename to use when uploading via image_data (default: image.png)
             append_to: Optional note filename to append the image markdown URL to
 
         Returns:
             Markdown URL of the uploaded image
         """
         try:
-            result = client.upload_image(file_path)
+            result = client.upload_image(
+                file_path=file_path,
+                image_data=image_data,
+                filename=filename
+            )
             markdown_url = result.get("data", {}).get("markdown_url", "")
             if append_to and markdown_url:
                 client.append_top(append_to, markdown_url)
