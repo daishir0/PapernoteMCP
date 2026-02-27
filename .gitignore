@@ -39,6 +39,9 @@ env/
 *.log
 logs/
 
+# Output files (may contain credentials)
+outputs/
+
 # OS
 .DS_Store
 Thumbs.db

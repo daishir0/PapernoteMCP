@@ -1,8 +1,37 @@
 """Papernote tools implementation for MCP Server."""
+import re
 import requests
 from typing import Optional
 from datetime import datetime
 from urllib.parse import quote
+
+
+def _parse_note_sections(content: str) -> list[dict]:
+    """# yyyymmdd... 見出しでノートをセクションに分割する"""
+    pattern = re.compile(r'^(# \d{8}[^\n]*)', re.MULTILINE)
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return []
+    sections = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i+1].start() if i+1 < len(matches) else len(content)
+        sections.append({
+            'title': match.group(1).strip(),
+            'content': content[start:end].rstrip()
+        })
+    return sections
+
+
+def _get_snippet(text: str, query: str, context_chars: int = 120) -> str:
+    """クエリ周辺のスニペットを抽出する"""
+    lower = text.lower()
+    idx = lower.find(query.lower())
+    if idx == -1:
+        return text[:context_chars].replace('\n', ' ')
+    start = max(0, idx - 40)
+    end = min(len(text), idx + len(query) + 80)
+    return text[start:end].replace('\n', ' ')
 
 
 class PapernoteClient:
@@ -481,6 +510,86 @@ def register_tools(mcp, config: dict):
             return "\n".join(output)
         except requests.exceptions.RequestException as e:
             return f"Error searching notes: {str(e)}"
+
+    @mcp.tool()
+    def get_note_section(filename: str, section_query: str) -> str:
+        """ノートの特定日付セクションのみ取得する（コンテキスト節約）。
+
+        1ファイルに複数の # yyyymmdd... セクションがある場合、
+        指定したセクションの内容だけを返す。
+
+        Args:
+            filename: ノートのファイル名
+            section_query: 日付文字列 (例: '20260227') またはタイトルの一部
+
+        Returns:
+            マッチしたセクションの内容、または利用可能なセクション一覧
+        """
+        try:
+            result = client.get_note(filename)
+            content = result.get("data", {}).get("content", "")
+            sections = _parse_note_sections(content)
+            if not sections:
+                return f"'{filename}' に # yyyymmdd セクションが見つかりません"
+            for section in sections:
+                if section_query in section['title']:
+                    return section['content']
+            titles = "\n".join(f"- {s['title']}" for s in sections)
+            return f"セクション '{section_query}' が見つかりません。利用可能なセクション:\n{titles}"
+        except requests.exceptions.RequestException as e:
+            return f"Error getting note section: {str(e)}"
+
+    @mcp.tool()
+    def search_sections(query: str, search_in: str = "body") -> str:
+        """複数ノートを横断してセクション単位で検索する。
+
+        # yyyymmdd... で区切られたセクションの中からクエリにマッチするものを返す。
+        ファイル全体ではなくセクション単位で返すためコンテキスト節約になる。
+
+        Args:
+            query: 検索クエリ文字列
+            search_in: 'title'（セクション見出しのみ）, 'body'（本文のみ）, 'all'（両方）
+
+        Returns:
+            マッチしたセクションの一覧（ファイル名・見出し・スニペット付き）
+        """
+        try:
+            # Step1: 既存APIで候補ファイルを絞り込み
+            search_result = client.search_notes(query, "all")
+            candidates = [p['filename'] for p in search_result.get("data", {}).get("posts", [])]
+            if not candidates:
+                return f"'{query}' を含むノートが見つかりません"
+
+            matches = []
+            for fname in candidates:
+                try:
+                    note_result = client.get_note(fname)
+                    content = note_result.get("data", {}).get("content", "")
+                    for section in _parse_note_sections(content):
+                        hit = False
+                        if search_in in ("title", "all") and query.lower() in section['title'].lower():
+                            hit = True
+                        if search_in in ("body", "all") and query.lower() in section['content'].lower():
+                            hit = True
+                        if hit:
+                            matches.append({
+                                'filename': fname,
+                                'section': section['title'],
+                                'snippet': _get_snippet(section['content'], query)
+                            })
+                except Exception:
+                    continue
+
+            if not matches:
+                return f"'{query}' を含むセクションが見つかりません"
+
+            output = [f"{len(matches)} 件のセクションが見つかりました:"]
+            for m in matches:
+                output.append(f"\n[{m['filename']}] {m['section']}")
+                output.append(f"  ...{m['snippet']}...")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error searching sections: {str(e)}"
 
     @mcp.tool()
     def list_notes(category: str = None, limit: int = 20) -> str:
