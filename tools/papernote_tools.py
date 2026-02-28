@@ -128,6 +128,9 @@ class PapernoteClient:
     def append_top(self, filename: str, content: str) -> dict:
         """Append content to the top of a note (after line 2).
 
+        Auto-inserts a # yyyymmddTitle date heading if the content
+        doesn't already contain one.
+
         Args:
             filename: The filename of the note
             content: Content to append
@@ -135,6 +138,21 @@ class PapernoteClient:
         Returns:
             Updated note info
         """
+        # 追加コンテンツに # yyyymmdd 日付見出しがなければ自動挿入
+        content_lines = content.split("\n")
+        has_date_heading = any(
+            line.startswith("# ") and not line.startswith("##")
+            and re.match(r'^# \d{8}', line)
+            for line in content_lines
+        )
+        if not has_date_heading:
+            # 最初の見出し行からタイトルテキストを抽出
+            first_line = content_lines[0]
+            title_text = first_line.lstrip("#").strip()
+            date_str = datetime.now().strftime("%Y%m%d")
+            date_heading = f"# {date_str}{title_text}"
+            content = f"{date_heading}\n\n{content}"
+
         # Get current content
         current = self.get_note(filename)
         # API returns {"data": {"content": "..."}, "status": "success"}
@@ -306,6 +324,45 @@ class PapernoteClient:
         else:
             raise ValueError("Either file_path or image_data must be provided")
 
+        response.raise_for_status()
+        return response.json()
+
+    def upload_paper(self, file_path: str = None, file_data: str = None, filename: str = "paper.pdf") -> dict:
+        """Upload a paper PDF to Papernote.
+
+        Args:
+            file_path: Path to the PDF file (local MCP server only)
+            file_data: Base64-encoded PDF data (for remote usage)
+            filename: Filename to use when uploading via file_data
+
+        Returns:
+            API response with upload result
+        """
+        import os
+        import base64
+        import io
+
+        base_url = self.api_url.replace("/posts", "")
+        url = f"{base_url}/papers"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        if file_data:
+            if "," in file_data:
+                header_part, data = file_data.split(",", 1)
+            else:
+                data = file_data
+            binary_data = base64.b64decode(data)
+            files = {'file': (filename, io.BytesIO(binary_data), 'application/pdf')}
+        elif file_path:
+            with open(file_path, 'rb') as f:
+                files = {'file': (os.path.basename(file_path), f, 'application/pdf')}
+                response = requests.post(url, headers=headers, files=files)
+                response.raise_for_status()
+                return response.json()
+        else:
+            raise ValueError("file_path or file_data required")
+
+        response = requests.post(url, headers=headers, files=files)
         response.raise_for_status()
         return response.json()
 
@@ -795,3 +852,22 @@ def register_tools(mcp, config: dict):
             return f"# {data.get('title', pdf_id)}\n\n{summary}"
         except requests.exceptions.RequestException as e:
             return f"Error getting paper summary: {str(e)}"
+
+    @mcp.tool()
+    def upload_paper(file_path: str = None, file_data: str = None, filename: str = "paper.pdf") -> str:
+        """Upload a paper PDF to Papernote.
+
+        Mode 1 - file_path (local): upload_paper(file_path="/path/to/paper.pdf")
+        Mode 2 - file_data (remote/Base64): upload_paper(file_data="base64string", filename="paper.pdf")
+
+        Returns: Upload result with pdf_id for future reference.
+        """
+        try:
+            result = client.upload_paper(file_path=file_path, file_data=file_data, filename=filename)
+            status = result.get("status", "unknown")
+            data = result.get("data", {})
+            pdf_id = data.get("pdf_id", "N/A")
+            orig = data.get("original_filename", filename)
+            return f"Status: {status}\nPDF ID: {pdf_id}\nOriginal: {orig}"
+        except requests.exceptions.RequestException as e:
+            return f"Error uploading paper: {str(e)}"
