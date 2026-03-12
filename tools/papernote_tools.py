@@ -366,6 +366,34 @@ class PapernoteClient:
         response.raise_for_status()
         return response.json()
 
+    # --- Section関連メソッド ---
+
+    def get_sections(self, filename: str, offset: int = 0, count: int = 3) -> dict:
+        """セクション単位でノートを取得（ページネーション対応）"""
+        encoded_filename = quote(filename, safe='')
+        url = f"{self.api_url}/{encoded_filename}/sections"
+        params = {"offset": offset, "count": count}
+        response = requests.get(url, params=params, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def get_section_titles(self, filename: str) -> dict:
+        """セクションタイトル一覧を取得"""
+        encoded_filename = quote(filename, safe='')
+        url = f"{self.api_url}/{encoded_filename}/sections/titles"
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
+    def search_note_sections(self, filename: str, query: str) -> dict:
+        """セクション名で検索（サーバー側部分一致）"""
+        encoded_filename = quote(filename, safe='')
+        url = f"{self.api_url}/{encoded_filename}/sections/search"
+        params = {"q": query}
+        response = requests.get(url, params=params, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+
     # --- Paper関連メソッド ---
 
     def search_papers(self, query: str) -> dict:
@@ -583,18 +611,40 @@ def register_tools(mcp, config: dict):
             マッチしたセクションの内容、または利用可能なセクション一覧
         """
         try:
-            result = client.get_note(filename)
-            content = result.get("data", {}).get("content", "")
-            sections = _parse_note_sections(content)
-            if not sections:
-                return f"'{filename}' に # yyyymmdd セクションが見つかりません"
-            for section in sections:
-                if section_query in section['title']:
-                    return section['content']
-            titles = "\n".join(f"- {s['title']}" for s in sections)
+            result = client.search_note_sections(filename, section_query)
+            data = result.get("data", {})
+            sections = data.get("sections", [])
+            if sections:
+                # 最初のマッチを返す
+                return sections[0].get("content", "")
+            # マッチなし → タイトル一覧を返す
+            titles_result = client.get_section_titles(filename)
+            titles_data = titles_result.get("data", {})
+            title_list = titles_data.get("titles", [])
+            if not title_list:
+                return f"'{filename}' にセクションが見つかりません"
+            titles = "\n".join(f"- [{t['index']}] {t['title']}" for t in title_list)
             return f"セクション '{section_query}' が見つかりません。利用可能なセクション:\n{titles}"
         except requests.exceptions.RequestException as e:
             return f"Error getting note section: {str(e)}"
+
+    @mcp.tool()
+    def list_note_sections(filename: str) -> str:
+        """ノート内のセクション（# 見出し）一覧を取得する。
+        内容を取得する前にどのセクションがあるか確認するのに使う。"""
+        try:
+            result = client.get_section_titles(filename)
+            data = result.get("data", {})
+            titles = data.get("titles", [])
+            total = data.get("total", 0)
+            if not titles:
+                return f"'{filename}' にセクションが見つかりません"
+            output = [f"{filename} のセクション一覧（全{total}件）:"]
+            for t in titles:
+                output.append(f"- [{t['index']}] {t['title']}")
+            return "\n".join(output)
+        except requests.exceptions.RequestException as e:
+            return f"Error listing sections: {str(e)}"
 
     @mcp.tool()
     def search_sections(query: str, search_in: str = "body") -> str:
@@ -618,24 +668,39 @@ def register_tools(mcp, config: dict):
                 return f"'{query}' を含むノートが見つかりません"
 
             matches = []
-            for fname in candidates:
-                try:
-                    note_result = client.get_note(fname)
-                    content = note_result.get("data", {}).get("content", "")
-                    for section in _parse_note_sections(content):
-                        hit = False
-                        if search_in in ("title", "all") and query.lower() in section['title'].lower():
-                            hit = True
-                        if search_in in ("body", "all") and query.lower() in section['content'].lower():
-                            hit = True
-                        if hit:
+            if search_in == "title":
+                # サーバーAPI活用：タイトル検索のみなので全文取得不要
+                for fname in candidates:
+                    try:
+                        result = client.search_note_sections(fname, query)
+                        for s in result.get("data", {}).get("sections", []):
                             matches.append({
                                 'filename': fname,
-                                'section': section['title'],
-                                'snippet': _get_snippet(section['content'], query)
+                                'section': f"# {s['title']}",
+                                'snippet': _get_snippet(s.get('content', ''), query)
                             })
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
+            else:
+                # body/all: 従来通り全文取得+クライアント側分割
+                for fname in candidates:
+                    try:
+                        note_result = client.get_note(fname)
+                        content = note_result.get("data", {}).get("content", "")
+                        for section in _parse_note_sections(content):
+                            hit = False
+                            if search_in == "all" and query.lower() in section['title'].lower():
+                                hit = True
+                            if query.lower() in section['content'].lower():
+                                hit = True
+                            if hit:
+                                matches.append({
+                                    'filename': fname,
+                                    'section': section['title'],
+                                    'snippet': _get_snippet(section['content'], query)
+                                })
+                    except Exception:
+                        continue
 
             if not matches:
                 return f"'{query}' を含むセクションが見つかりません"
