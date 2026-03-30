@@ -150,7 +150,11 @@ class PapernoteClient:
             first_line = content_lines[0]
             title_text = first_line.lstrip("#").strip()
             date_str = datetime.now().strftime("%Y%m%d")
-            date_heading = f"# {date_str}{title_text}"
+            # 画像マークダウンやURLはタイトルに含めない
+            if title_text.startswith("[![") or title_text.startswith("![") or title_text.startswith("http"):
+                date_heading = f"# {date_str}"
+            else:
+                date_heading = f"# {date_str}{title_text}"
             content = f"{date_heading}\n\n{content}"
 
         # Get current content
@@ -283,13 +287,15 @@ class PapernoteClient:
         response.raise_for_status()
         return response.json()
 
-    def upload_image(self, file_path: str = None, image_data: str = None, filename: str = "image.png") -> dict:
+    def upload_image(self, file_path: str = None, image_data: str = None,
+                     image_url: str = None, filename: str = "image.png") -> dict:
         """Upload an image to Papernote.
 
         Args:
             file_path: Path to the image file (local MCP server only)
             image_data: Base64-encoded image data (for remote Claude.ai usage)
-            filename: Filename to use when uploading via image_data
+            image_url: URL to download the image from (avoids base64 context bloat)
+            filename: Filename to use when uploading via image_data/image_url
 
         Returns:
             API response with markdown_url
@@ -298,32 +304,91 @@ class PapernoteClient:
         import base64
         import io
 
+        MAX_SIZE = 10 * 1024 * 1024  # 10MB (server limit)
+        COMPRESS_THRESHOLD = 500 * 1024  # 500KB
+
         base_url = self.api_url.replace("/posts", "")
         url = f"{base_url}/images"
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
-        if image_data:
-            # Base64文字列をデコードしてバイナリとして送信
+        binary_data = None
+        mime_type = None
+        ext = None
+
+        if image_url:
+            # Mode 3: URL経由ダウンロード
+            resp = requests.get(image_url, timeout=30)
+            resp.raise_for_status()
+            binary_data = resp.content
+            content_type = resp.headers.get('Content-Type', 'image/png').split(';')[0].strip()
+            mime_type = content_type
+            ext = content_type.split('/')[-1].replace('svg+xml', 'svg').replace('jpeg', 'jpg')
+            if filename == 'image.png':
+                url_path = image_url.split('?')[0].split('/')[-1]
+                if '.' in url_path:
+                    filename = url_path
+                else:
+                    filename = f"image.{ext}"
+
+        elif image_data:
+            # Mode 2: Base64文字列をデコード
             # data:image/png;base64,... 形式にも対応
             if "," in image_data:
                 header, data = image_data.split(",", 1)
                 mime_type = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
-                ext = mime_type.split("/")[-1]
+                ext = mime_type.split("/")[-1].replace('svg+xml', 'svg').replace('jpeg', 'jpg')
             else:
                 data = image_data
                 ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'png'
-                mime_type = f"image/{ext}"
+                mime_type = 'image/svg+xml' if ext == 'svg' else f"image/{ext}"
             binary_data = base64.b64decode(data)
-            files = {'file': (filename, io.BytesIO(binary_data), mime_type)}
-            response = requests.post(url, headers=headers, files=files)
-        elif file_path:
-            ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
-            with open(file_path, 'rb') as f:
-                files = {'file': (os.path.basename(file_path), f, f'image/{ext}')}
-                response = requests.post(url, headers=headers, files=files)
-        else:
-            raise ValueError("Either file_path or image_data must be provided")
 
+        elif file_path:
+            # Mode 1: ローカルファイルパス
+            ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
+            mime_type = 'image/svg+xml' if ext == 'svg' else f'image/{ext}'
+            with open(file_path, 'rb') as f:
+                binary_data = f.read()
+            if filename == 'image.png':
+                filename = os.path.basename(file_path)
+
+        else:
+            raise ValueError(
+                "One of file_path, image_data, or image_url must be provided.\n"
+                "- file_path: local file (Claude Code)\n"
+                "- image_data: base64 string (Claude.ai Web)\n"
+                "- image_url: URL to download from (recommended for large images)"
+            )
+
+        # 大画像の自動圧縮（SVG/GIF除外）
+        if (len(binary_data) > COMPRESS_THRESHOLD and
+                ext not in ('svg', 'gif')):
+            try:
+                from PIL import Image as PILImage
+                img = PILImage.open(io.BytesIO(binary_data))
+                max_dim = 2000
+                if max(img.size) > max_dim:
+                    img.thumbnail((max_dim, max_dim), PILImage.Resampling.LANCZOS)
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                buf = io.BytesIO()
+                img.save(buf, format='JPEG', quality=85, optimize=True)
+                binary_data = buf.getvalue()
+                filename = filename.rsplit('.', 1)[0] + '.jpg' if '.' in filename else 'image.jpg'
+                mime_type = 'image/jpeg'
+                ext = 'jpg'
+            except Exception:
+                pass  # 圧縮失敗時はそのまま送信
+
+        # サイズチェック
+        if len(binary_data) > MAX_SIZE:
+            raise ValueError(
+                f"Image too large ({len(binary_data) / 1024 / 1024:.1f}MB). "
+                f"Maximum is 10MB. Try a smaller image or use image_url for URL-based upload."
+            )
+
+        files = {'file': (filename, io.BytesIO(binary_data), mime_type)}
+        response = requests.post(url, headers=headers, files=files)
         response.raise_for_status()
         return response.json()
 
@@ -776,25 +841,35 @@ def register_tools(mcp, config: dict):
     def upload_image(
         file_path: str = None,
         image_data: str = None,
+        image_url: str = None,
         filename: str = "image.png",
         append_to: str = None
     ) -> str:
         """Upload an image to Papernote.
 
-        Two modes depending on the environment:
+        Three modes depending on the environment:
 
-        Mode 1 - file_path (local MCP server only):
+        Mode 1 - file_path (local MCP server / Claude Code):
           upload_image(file_path="/path/to/image.png")
 
         Mode 2 - image_data (for Claude.ai Web / remote usage):
-          Read the image file, encode it as Base64, and pass the string.
-          Supports raw Base64 or data URI format (data:image/png;base64,...).
+          Base64-encoded image data. Supports raw Base64 or data URI format.
           upload_image(image_data="iVBORw0KGgo...", filename="photo.png")
+          Note: Images >500KB are auto-compressed to JPEG to save context.
+
+        Mode 3 - image_url (recommended for large images):
+          Download image from URL and upload. Avoids base64 context bloat.
+          upload_image(image_url="https://example.com/image.png")
+
+        Supported formats: jpg, png, gif, webp, svg, heic, heif
+        Max file size: 10MB (auto-compression applied for images >500KB)
+        HEIC/HEIF images are auto-converted to JPEG on the server.
 
         Args:
-            file_path: Path to the image file (jpg/png/gif/webp etc.)
+            file_path: Path to the image file
             image_data: Base64-encoded image data string
-            filename: Filename to use when uploading via image_data (default: image.png)
+            image_url: URL to download the image from
+            filename: Filename to use (default: image.png)
             append_to: Optional note filename to append the image markdown URL to
 
         Returns:
@@ -804,6 +879,7 @@ def register_tools(mcp, config: dict):
             result = client.upload_image(
                 file_path=file_path,
                 image_data=image_data,
+                image_url=image_url,
                 filename=filename
             )
             markdown_url = result.get("data", {}).get("markdown_url", "")
@@ -811,6 +887,18 @@ def register_tools(mcp, config: dict):
                 client.append_top(append_to, markdown_url)
                 return f"Uploaded and appended to {append_to}: {markdown_url}"
             return f"Uploaded: {markdown_url}"
+        except ValueError as e:
+            return f"Validation error: {str(e)}"
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 413:
+                return "Error: Image too large (server limit is 10MB). Try a smaller image."
+            if e.response is not None and e.response.status_code == 400:
+                try:
+                    body = e.response.json()
+                    return f"Error: {body.get('message', str(e))}"
+                except Exception:
+                    pass
+            return f"Error uploading image: {str(e)}"
         except Exception as e:
             return f"Error uploading image: {str(e)}"
 
