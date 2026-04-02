@@ -288,14 +288,16 @@ class PapernoteClient:
         return response.json()
 
     def upload_image(self, file_path: str = None, image_data: str = None,
-                     image_url: str = None, filename: str = "image.png") -> dict:
+                     image_url: str = None, svg_content: str = None,
+                     filename: str = "image.png") -> dict:
         """Upload an image to Papernote.
 
         Args:
             file_path: Path to the image file (local MCP server only)
             image_data: Base64-encoded image data (for remote Claude.ai usage)
             image_url: URL to download the image from (avoids base64 context bloat)
-            filename: Filename to use when uploading via image_data/image_url
+            svg_content: Raw SVG XML text (for Claude.ai Web - no base64 overhead)
+            filename: Filename to use when uploading via image_data/image_url/svg_content
 
         Returns:
             API response with markdown_url
@@ -329,6 +331,14 @@ class PapernoteClient:
                     filename = url_path
                 else:
                     filename = f"image.{ext}"
+
+        elif svg_content:
+            # Mode 4: SVG XML text directly (Claude.ai Web - no base64 overhead)
+            binary_data = svg_content.encode('utf-8')
+            mime_type = 'image/svg+xml'
+            ext = 'svg'
+            if filename == 'image.png':
+                filename = 'image.svg'
 
         elif image_data:
             # Mode 2: Base64文字列をデコード
@@ -842,12 +852,13 @@ def register_tools(mcp, config: dict):
         file_path: str = None,
         image_data: str = None,
         image_url: str = None,
+        svg_content: str = None,
         filename: str = "image.png",
         append_to: str = None
     ) -> str:
         """Upload an image to Papernote.
 
-        Three modes depending on the environment:
+        Four modes depending on the environment:
 
         Mode 1 - file_path (local MCP server / Claude Code):
           upload_image(file_path="/path/to/image.png")
@@ -861,6 +872,10 @@ def register_tools(mcp, config: dict):
           Download image from URL and upload. Avoids base64 context bloat.
           upload_image(image_url="https://example.com/image.png")
 
+        Mode 4 - svg_content (for Claude.ai Web / SVG charts):
+          Pass SVG XML text directly. No base64 encoding needed.
+          upload_image(svg_content="<svg>...</svg>", filename="chart.svg")
+
         Supported formats: jpg, png, gif, webp, svg, heic, heif
         Max file size: 10MB (auto-compression applied for images >500KB)
         HEIC/HEIF images are auto-converted to JPEG on the server.
@@ -869,6 +884,7 @@ def register_tools(mcp, config: dict):
             file_path: Path to the image file
             image_data: Base64-encoded image data string
             image_url: URL to download the image from
+            svg_content: Raw SVG XML text string (no base64 needed)
             filename: Filename to use (default: image.png)
             append_to: Optional note filename to append the image markdown URL to
 
@@ -880,6 +896,7 @@ def register_tools(mcp, config: dict):
                 file_path=file_path,
                 image_data=image_data,
                 image_url=image_url,
+                svg_content=svg_content,
                 filename=filename
             )
             markdown_url = result.get("data", {}).get("markdown_url", "")
