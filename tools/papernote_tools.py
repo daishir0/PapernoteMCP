@@ -4,6 +4,8 @@ import requests
 from typing import Optional
 from datetime import datetime
 from urllib.parse import quote
+from mcp.types import ImageContent, TextContent
+import base64
 
 
 def _parse_note_sections(content: str) -> list[dict]:
@@ -286,6 +288,28 @@ class PapernoteClient:
         response = requests.delete(url, headers=self.headers)
         response.raise_for_status()
         return response.json()
+
+    def download_attachment(self, path: str) -> tuple[bytes, str]:
+        """Download an attachment from Papernote.
+
+        Args:
+            path: Attachment path (e.g., /attach/HASH.png)
+
+        Returns:
+            Tuple of (binary_data, content_type)
+        """
+        # Build full URL from API URL
+        # api_url = https://paper.path-finder.jp/api/posts
+        # site_url = https://paper.path-finder.jp
+        site_url = self.api_url.split('/api/')[0]
+        # Ensure path starts with /
+        if not path.startswith('/'):
+            path = '/' + path
+        url = f"{site_url}{path}"
+        response = requests.get(url, headers={"Authorization": f"Bearer {self.api_key}"}, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', 'image/png').split(';')[0].strip()
+        return response.content, content_type
 
     def upload_image(self, file_path: str = None, image_data: str = None,
                      image_url: str = None, svg_content: str = None,
@@ -1041,3 +1065,70 @@ def register_tools(mcp, config: dict):
             return f"Status: {status}\nPDF ID: {pdf_id}\nOriginal: {orig}"
         except requests.exceptions.RequestException as e:
             return f"Error uploading paper: {str(e)}"
+
+    # --- Phase 5: 添付ファイル取得ツール ---
+
+    @mcp.tool()
+    def list_attachments(filename: str) -> str:
+        """List all image/attachment URLs referenced in a note's markdown content.
+
+        Parses the note content for markdown image links (![...](/attach/...))
+        and returns a numbered list of attachment paths.
+
+        Args:
+            filename: The filename of the note
+
+        Returns:
+            List of attachment paths found in the note
+        """
+        try:
+            result = client.get_note(filename)
+            content = result.get("data", {}).get("content", "")
+            # Match markdown image/link patterns: (/attach/HASH.ext) or (/attach/HASH.ext "title")
+            pattern = re.compile(r'\(/attach/([^\s)"]+)')
+            matches = pattern.findall(content)
+            # Deduplicate while preserving order, skip thumbnails (s_ prefix)
+            seen = set()
+            attachments = []
+            for match in matches:
+                # Skip thumbnail versions (s_ prefix)
+                if match.startswith('s_'):
+                    continue
+                if match not in seen:
+                    seen.add(match)
+                    attachments.append(f"/attach/{match}")
+            if not attachments:
+                return "No attachments found in this note."
+            lines = [f"{i+1}. {path}" for i, path in enumerate(attachments)]
+            return f"Found {len(attachments)} attachment(s):\n" + "\n".join(lines)
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def get_attachment(path: str) -> list[TextContent | ImageContent]:
+        """Download an attachment (image) from Papernote and return it visually.
+
+        Use list_attachments first to find available paths, then pass a path here.
+        Returns the image so Claude.ai can see and analyze it directly.
+
+        Args:
+            path: Attachment path (e.g., /attach/abc123.png)
+
+        Returns:
+            The image content (displayed visually in Claude.ai)
+        """
+        try:
+            binary_data, content_type = client.download_attachment(path)
+            if content_type == 'image/svg+xml':
+                return [TextContent(
+                    type="text",
+                    text=f"SVG content:\n```xml\n{binary_data.decode('utf-8')}\n```"
+                )]
+            b64_data = base64.b64encode(binary_data).decode('utf-8')
+            return [ImageContent(
+                type="image",
+                data=b64_data,
+                mimeType=content_type
+            )]
+        except requests.exceptions.RequestException as e:
+            return [TextContent(type="text", text=f"Error downloading attachment: {str(e)}")]
