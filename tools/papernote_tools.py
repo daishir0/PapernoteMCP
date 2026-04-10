@@ -25,6 +25,48 @@ def _parse_note_sections(content: str) -> list[dict]:
     return sections
 
 
+def _split_lines(content: str) -> list[str]:
+    """LF 前提で行分割する。末尾の空行も保持する。"""
+    return content.split("\n")
+
+
+def _join_lines(lines: list[str]) -> str:
+    """_split_lines の逆変換。"""
+    return "\n".join(lines)
+
+
+def _validate_range(from_line: int, to_line: int, total: int) -> tuple:
+    """行番号範囲 [from_line, to_line] を検証する。
+
+    Args:
+        from_line: 1-indexed 開始行
+        to_line: 1-indexed 終了行（-1 で末尾まで）
+        total: 対象メモの総行数
+
+    Returns:
+        (True, (from, to)) もしくは (False, error_message)
+    """
+    if to_line == -1:
+        to_line = total
+    if not isinstance(from_line, int) or not isinstance(to_line, int):
+        return (False, f"from_line/to_line は整数である必要があります (got {from_line}, {to_line})")
+    if total == 0:
+        return (False, "メモが空です")
+    if from_line < 1 or from_line > total:
+        return (False, f"from_line {from_line} は範囲外です (有効範囲: 1..{total})")
+    if to_line < from_line or to_line > total:
+        return (False, f"to_line {to_line} は範囲外です (有効範囲: {from_line}..{total})")
+    return (True, (from_line, to_line))
+
+
+def _format_numbered_lines(lines: list[str], start_line: int) -> str:
+    """行番号付きのプレビュー形式に整形する。AI が再パースしやすい固定幅。"""
+    out = []
+    for i, line in enumerate(lines):
+        out.append("{:>5}: {}".format(start_line + i, line))
+    return "\n".join(out)
+
+
 def _get_snippet(text: str, query: str, context_chars: int = 120) -> str:
     """クエリ周辺のスニペットを抽出する"""
     lower = text.lower()
@@ -493,6 +535,403 @@ class PapernoteClient:
         response.raise_for_status()
         return response.json()
 
+    # --- 行ベースランダムアクセス/編集メソッド ---
+
+    def _fetch_lines(self, filename: str) -> list[str]:
+        """内部用: ノート全文を取得し行配列にして返す。"""
+        current = self.get_note(filename)
+        content = current.get("data", {}).get("content", "")
+        return _split_lines(content)
+
+    def get_note_info(self, filename: str) -> dict:
+        """ノートのメタ情報（総行数・タイトル・セクション開始行）を返す。"""
+        current = self.get_note(filename)
+        content = current.get("data", {}).get("content", "")
+        lines = _split_lines(content)
+        total_lines = len(lines)
+
+        # セクション見出し行を行番号付きで収集（# yyyymmdd... のみ）
+        pattern = re.compile(r'^# \d{8}')
+        section_heads = []
+        for i, line in enumerate(lines, start=1):
+            if pattern.match(line):
+                section_heads.append({"index": len(section_heads), "title": line.strip(), "start_line": i})
+        # 各セクションの end_line を決定
+        for idx, s in enumerate(section_heads):
+            if idx + 1 < len(section_heads):
+                s["end_line"] = section_heads[idx + 1]["start_line"] - 1
+            else:
+                s["end_line"] = total_lines
+
+        title_line = lines[0] if lines else ""
+        return {
+            "filename": filename,
+            "total_lines": total_lines,
+            "title": title_line,
+            "sections": section_heads,
+        }
+
+    def get_note_lines(self, filename: str, from_line: int, to_line: int = -1, around: int = 0) -> dict:
+        """指定行範囲の行を返す。1-indexed 両端含む。
+
+        around > 0 の場合は from_line を中心に前後 around 行（to_line は無視）。
+        """
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+
+        if around > 0:
+            center = from_line
+            f = max(1, center - around)
+            t = min(total, center + around)
+            valid = (True, (f, t))
+        else:
+            valid = _validate_range(from_line, to_line, total)
+
+        if not valid[0]:
+            return {"error": valid[1], "total_lines": total}
+
+        f, t = valid[1]
+        selected = lines[f - 1:t]
+        return {
+            "filename": filename,
+            "from_line": f,
+            "to_line": t,
+            "total_lines": total,
+            "lines": selected,
+        }
+
+    def find_note_lines(self, filename: str, pattern: str, is_regex: bool = False,
+                        max_results: int = 50, context_lines: int = 0) -> dict:
+        """ノート内で pattern にマッチする行番号を返す。
+
+        context_lines > 0 で前後 N 行の文脈も同梱。
+        """
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+
+        if is_regex:
+            try:
+                regex = re.compile(pattern)
+            except re.error as e:
+                return {"error": f"invalid regex: {e}", "total_lines": total}
+            matcher = lambda s: regex.search(s) is not None
+        else:
+            needle = pattern
+            matcher = lambda s: needle in s
+
+        hits = []
+        for i, line in enumerate(lines, start=1):
+            if matcher(line):
+                hit = {"line_number": i, "text": line}
+                if context_lines > 0:
+                    bs = max(1, i - context_lines)
+                    be = i - 1
+                    af_s = i + 1
+                    af_e = min(total, i + context_lines)
+                    hit["before"] = [{"line_number": n, "text": lines[n - 1]} for n in range(bs, be + 1)] if be >= bs else []
+                    hit["after"] = [{"line_number": n, "text": lines[n - 1]} for n in range(af_s, af_e + 1)] if af_e >= af_s else []
+                hits.append(hit)
+                if len(hits) >= max_results:
+                    break
+
+        return {
+            "filename": filename,
+            "total_lines": total,
+            "match_count": len(hits),
+            "hits": hits,
+        }
+
+    def search_notes_lines(self, query: str, is_regex: bool = False,
+                           max_files: int = 20, max_per_file: int = 20) -> dict:
+        """グローバル行検索: 複数ノートから行単位ヒットを返す。"""
+        search_result = self.search_notes(query, "all")
+        candidates = [p['filename'] for p in search_result.get("data", {}).get("posts", [])]
+        candidates = candidates[:max_files]
+
+        results = []
+        for fname in candidates:
+            try:
+                r = self.find_note_lines(fname, query, is_regex=is_regex, max_results=max_per_file)
+                for hit in r.get("hits", []):
+                    results.append({
+                        "filename": fname,
+                        "line_number": hit["line_number"],
+                        "text": hit["text"],
+                    })
+            except Exception:
+                continue
+        return {
+            "query": query,
+            "file_count": len(candidates),
+            "match_count": len(results),
+            "results": results,
+        }
+
+    def replace_note_lines(self, filename: str, from_line: int, to_line: int,
+                           content: str, dry_run: bool = False) -> dict:
+        """行 [from_line..to_line] を content で置き換え。"""
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+        ok, val = _validate_range(from_line, to_line, total)
+        if not ok:
+            return {"error": val, "total_lines": total}
+        f, t = val
+
+        new_chunk = content.split("\n") if content != "" else []
+        new_lines = lines[:f - 1] + new_chunk + lines[t:]
+        new_total = len(new_lines)
+
+        if dry_run:
+            return {
+                "filename": filename,
+                "dry_run": True,
+                "from_line": f,
+                "to_line": t,
+                "lines_removed": (t - f + 1),
+                "lines_inserted": len(new_chunk),
+                "total_lines_before": total,
+                "total_lines_after": new_total,
+                "preview": _format_numbered_lines(new_lines[max(0, f - 3):f - 1 + len(new_chunk) + 2], max(1, f - 2)),
+            }
+
+        self.update_full(filename, _join_lines(new_lines))
+        return {
+            "filename": filename,
+            "from_line": f,
+            "to_line": t,
+            "lines_removed": (t - f + 1),
+            "lines_inserted": len(new_chunk),
+            "total_lines_before": total,
+            "total_lines_after": new_total,
+        }
+
+    def insert_note_lines(self, filename: str, at_line: int, content: str,
+                          dry_run: bool = False) -> dict:
+        """行 at_line の直前に content を挿入。at_line = total+1 で末尾追記。"""
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+        if not isinstance(at_line, int) or at_line < 1 or at_line > total + 1:
+            return {"error": f"at_line {at_line} は範囲外です (有効範囲: 1..{total + 1})", "total_lines": total}
+
+        new_chunk = content.split("\n") if content != "" else [""]
+        new_lines = lines[:at_line - 1] + new_chunk + lines[at_line - 1:]
+        new_total = len(new_lines)
+
+        if dry_run:
+            return {
+                "filename": filename,
+                "dry_run": True,
+                "at_line": at_line,
+                "lines_inserted": len(new_chunk),
+                "total_lines_before": total,
+                "total_lines_after": new_total,
+                "preview": _format_numbered_lines(
+                    new_lines[max(0, at_line - 3):at_line - 1 + len(new_chunk) + 2],
+                    max(1, at_line - 2),
+                ),
+            }
+
+        self.update_full(filename, _join_lines(new_lines))
+        return {
+            "filename": filename,
+            "at_line": at_line,
+            "lines_inserted": len(new_chunk),
+            "total_lines_before": total,
+            "total_lines_after": new_total,
+        }
+
+    def delete_note_lines(self, filename: str, from_line: int, to_line: int,
+                          dry_run: bool = False) -> dict:
+        """行 [from_line..to_line] を削除。"""
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+        ok, val = _validate_range(from_line, to_line, total)
+        if not ok:
+            return {"error": val, "total_lines": total}
+        f, t = val
+        new_lines = lines[:f - 1] + lines[t:]
+        new_total = len(new_lines)
+
+        if dry_run:
+            return {
+                "filename": filename,
+                "dry_run": True,
+                "from_line": f,
+                "to_line": t,
+                "lines_removed": (t - f + 1),
+                "total_lines_before": total,
+                "total_lines_after": new_total,
+                "preview": _format_numbered_lines(
+                    new_lines[max(0, f - 3):f + 1],
+                    max(1, f - 2),
+                ) if new_lines else "(empty)",
+            }
+
+        self.update_full(filename, _join_lines(new_lines))
+        return {
+            "filename": filename,
+            "from_line": f,
+            "to_line": t,
+            "lines_removed": (t - f + 1),
+            "total_lines_before": total,
+            "total_lines_after": new_total,
+        }
+
+    def move_note_lines(self, filename: str, from_line: int, to_line: int,
+                        dest_line: int, dry_run: bool = False) -> dict:
+        """ブロック [from..to] を dest_line の直前に移動。"""
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+        ok, val = _validate_range(from_line, to_line, total)
+        if not ok:
+            return {"error": val, "total_lines": total}
+        f, t = val
+        if not isinstance(dest_line, int) or dest_line < 1 or dest_line > total + 1:
+            return {"error": f"dest_line {dest_line} は範囲外です (有効範囲: 1..{total + 1})", "total_lines": total}
+        if f <= dest_line <= t + 1:
+            return {"error": f"dest_line {dest_line} が移動元ブロック [{f}..{t}] 内または直後にあり no-op です", "total_lines": total}
+
+        block = lines[f - 1:t]
+        remaining = lines[:f - 1] + lines[t:]
+        # dest_line の補正: ブロックより後ろ (dest_line > t) なら削除分だけ左にずらす
+        if dest_line > t:
+            adj = dest_line - (t - f + 1)
+        else:
+            adj = dest_line
+        new_lines = remaining[:adj - 1] + block + remaining[adj - 1:]
+        new_total = len(new_lines)
+
+        if dry_run:
+            return {
+                "filename": filename,
+                "dry_run": True,
+                "from_line": f,
+                "to_line": t,
+                "dest_line": dest_line,
+                "block_size": len(block),
+                "total_lines_before": total,
+                "total_lines_after": new_total,
+                "preview": _format_numbered_lines(
+                    new_lines[max(0, adj - 3):adj - 1 + len(block) + 2],
+                    max(1, adj - 2),
+                ),
+            }
+
+        self.update_full(filename, _join_lines(new_lines))
+        return {
+            "filename": filename,
+            "from_line": f,
+            "to_line": t,
+            "dest_line": dest_line,
+            "block_size": len(block),
+            "total_lines_before": total,
+            "total_lines_after": new_total,
+        }
+
+    def batch_edit_note(self, filename: str, operations: list, dry_run: bool = False) -> dict:
+        """複数の行編集操作を 1 回の PUT で原子的に適用する。
+
+        operations の各要素は以下のいずれか:
+          {"op": "replace", "from_line": int, "to_line": int, "content": str}
+          {"op": "insert",  "at_line": int, "content": str}
+          {"op": "delete",  "from_line": int, "to_line": int}
+          {"op": "move",    "from_line": int, "to_line": int, "dest_line": int}
+
+        すべて **元のメモの行番号** を基準に指定すること。
+        内部で行番号の大きい順にソートして末尾から適用するため、
+        ユーザー側で番号ずれを考慮する必要は無い。
+        """
+        lines = self._fetch_lines(filename)
+        total = len(lines)
+
+        # move を delete+insert に正規化
+        normalized = []
+        for idx, op in enumerate(operations):
+            name = op.get("op")
+            if name == "move":
+                f = op.get("from_line")
+                t = op.get("to_line")
+                d = op.get("dest_line")
+                ok, val = _validate_range(f, t, total)
+                if not ok:
+                    return {"error": f"op[{idx}] (move) {val}"}
+                if not isinstance(d, int) or d < 1 or d > total + 1:
+                    return {"error": f"op[{idx}] (move) dest_line {d} は範囲外"}
+                if f <= d <= t + 1:
+                    return {"error": f"op[{idx}] (move) dest_line が移動元ブロック内/直後で no-op"}
+                block = lines[f - 1:t]
+                block_content = _join_lines(block)
+                # 削除と挿入に分解（元のインデックス基準のまま）
+                normalized.append({"op": "delete", "from_line": f, "to_line": t, "_sort": f})
+                normalized.append({"op": "insert", "at_line": d, "content": block_content, "_sort": d - 0.5})
+            elif name == "replace":
+                f = op.get("from_line")
+                t = op.get("to_line")
+                c = op.get("content", "")
+                ok, val = _validate_range(f, t, total)
+                if not ok:
+                    return {"error": f"op[{idx}] (replace) {val}"}
+                normalized.append({"op": "replace", "from_line": f, "to_line": t, "content": c, "_sort": f})
+            elif name == "insert":
+                a = op.get("at_line")
+                c = op.get("content", "")
+                if not isinstance(a, int) or a < 1 or a > total + 1:
+                    return {"error": f"op[{idx}] (insert) at_line {a} は範囲外 (1..{total + 1})"}
+                normalized.append({"op": "insert", "at_line": a, "content": c, "_sort": a - 0.5})
+            elif name == "delete":
+                f = op.get("from_line")
+                t = op.get("to_line")
+                ok, val = _validate_range(f, t, total)
+                if not ok:
+                    return {"error": f"op[{idx}] (delete) {val}"}
+                normalized.append({"op": "delete", "from_line": f, "to_line": t, "_sort": f})
+            else:
+                return {"error": f"op[{idx}] 不明な op: {name}"}
+
+        # 重なりチェック（単純: 同じ行を複数 replace/delete で触るのは禁止）
+        touched_ranges = []
+        for n in normalized:
+            if n["op"] in ("replace", "delete"):
+                touched_ranges.append((n["from_line"], n["to_line"]))
+        touched_ranges.sort()
+        for i in range(len(touched_ranges) - 1):
+            if touched_ranges[i][1] >= touched_ranges[i + 1][0]:
+                return {"error": f"重なる範囲を複数の replace/delete で触れません: {touched_ranges[i]} と {touched_ranges[i+1]}"}
+
+        # _sort 降順で適用
+        normalized.sort(key=lambda x: x["_sort"], reverse=True)
+        buf = list(lines)
+        for n in normalized:
+            if n["op"] == "replace":
+                f, t, c = n["from_line"], n["to_line"], n["content"]
+                chunk = c.split("\n") if c != "" else []
+                buf = buf[:f - 1] + chunk + buf[t:]
+            elif n["op"] == "insert":
+                a, c = n["at_line"], n["content"]
+                chunk = c.split("\n") if c != "" else [""]
+                buf = buf[:a - 1] + chunk + buf[a - 1:]
+            elif n["op"] == "delete":
+                f, t = n["from_line"], n["to_line"]
+                buf = buf[:f - 1] + buf[t:]
+
+        new_total = len(buf)
+        if dry_run:
+            return {
+                "filename": filename,
+                "dry_run": True,
+                "applied": len(operations),
+                "total_lines_before": total,
+                "total_lines_after": new_total,
+            }
+
+        self.update_full(filename, _join_lines(buf))
+        return {
+            "filename": filename,
+            "applied": len(operations),
+            "total_lines_before": total,
+            "total_lines_after": new_total,
+        }
+
     # --- Paper関連メソッド ---
 
     def search_papers(self, query: str) -> dict:
@@ -584,11 +1023,13 @@ def register_tools(mcp, config: dict):
             return f"Error creating note: {str(e)}"
 
     @mcp.tool()
-    def get_note(filename: str) -> str:
+    def get_note(filename: str, with_line_numbers: bool = False) -> str:
         """Get a note from Papernote by filename.
 
         Args:
             filename: The filename of the note (e.g., '[_]20250121-123456.txt')
+            with_line_numbers: True で各行に "   12: text" 形式の行番号を付加する。
+                               行ベース編集（replace_note_lines 等）の前段で全文を行番号付きで確認したい時に便利。
 
         Returns:
             The note content
@@ -597,7 +1038,10 @@ def register_tools(mcp, config: dict):
             result = client.get_note(filename)
             # API returns {"data": {"content": "..."}, "status": "success"}
             data = result.get("data", {})
-            return data.get("content", "Note content not found")
+            content = data.get("content", "Note content not found")
+            if with_line_numbers and content:
+                return _format_numbered_lines(_split_lines(content), 1)
+            return content
         except requests.exceptions.RequestException as e:
             return f"Error getting note: {str(e)}"
 
@@ -728,10 +1172,24 @@ def register_tools(mcp, config: dict):
             return f"Error getting note section: {str(e)}"
 
     @mcp.tool()
-    def list_note_sections(filename: str) -> str:
+    def list_note_sections(filename: str, with_line_numbers: bool = False) -> str:
         """ノート内のセクション（# 見出し）一覧を取得する。
-        内容を取得する前にどのセクションがあるか確認するのに使う。"""
+        内容を取得する前にどのセクションがあるか確認するのに使う。
+
+        with_line_numbers=True を指定すると、各セクションの開始/終了行も併記する
+        （内部で get_note_info と同等の処理を行う）。行ベース編集の前準備に便利。
+        """
         try:
+            if with_line_numbers:
+                info = client.get_note_info(filename)
+                sections = info.get("sections", [])
+                if not sections:
+                    return f"'{filename}' にセクションが見つかりません"
+                out = [f"{filename} のセクション一覧（全{len(sections)}件, total_lines={info['total_lines']}）:"]
+                for s in sections:
+                    out.append(f"- [{s['index']}] L{s['start_line']}-L{s['end_line']}: {s['title']}")
+                return "\n".join(out)
+
             result = client.get_section_titles(filename)
             data = result.get("data", {})
             titles = data.get("titles", [])
@@ -1132,3 +1590,281 @@ def register_tools(mcp, config: dict):
             )]
         except requests.exceptions.RequestException as e:
             return [TextContent(type="text", text=f"Error downloading attachment: {str(e)}")]
+
+    # --- Phase: 行ベースランダムアクセス/編集ツール ---
+
+    @mcp.tool()
+    def get_note_info(filename: str) -> str:
+        """ノートのメタ情報（総行数・タイトル・セクション見出しと行番号）を返す。
+
+        行ベース編集（get_note_lines / replace_note_lines 等）を行う前の orient 用。
+        ノート全文を取らないので AI のコンテキストを節約できる。
+
+        Args:
+            filename: ノートのファイル名
+
+        Returns:
+            総行数、タイトル行、各セクションの開始/終了行
+        """
+        try:
+            info = client.get_note_info(filename)
+            out = [
+                f"File: {info['filename']}",
+                f"Total lines: {info['total_lines']}",
+                f"Title: {info['title']}",
+            ]
+            sections = info.get("sections", [])
+            if sections:
+                out.append(f"Sections ({len(sections)}):")
+                for s in sections:
+                    out.append(f"  [{s['index']}] L{s['start_line']}-L{s['end_line']}: {s['title']}")
+            else:
+                out.append("Sections: (none)")
+            return "\n".join(out)
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def get_note_lines(filename: str, from_line: int, to_line: int = -1,
+                       with_line_numbers: bool = True, around: int = 0) -> str:
+        """ノートの指定行範囲を取得する。1-indexed, 両端を含む。
+
+        - to_line=-1 で末尾まで
+        - around>0 を指定すると from_line を中心に前後 N 行を返す（to_line は無視）
+        - with_line_numbers=True なら "   12: text" 形式で行番号付きで返す
+
+        Args:
+            filename: ノートのファイル名
+            from_line: 開始行（1-indexed）。around 指定時は中心行。
+            to_line: 終了行（1-indexed, 両端含む）。-1 で末尾まで。
+            with_line_numbers: 行番号を付加するか（デフォルト True）
+            around: >0 で from_line の前後 N 行を返す
+
+        Returns:
+            行範囲のテキスト
+        """
+        try:
+            result = client.get_note_lines(filename, from_line, to_line, around=around)
+            if "error" in result:
+                return f"Error: {result['error']} (total_lines={result.get('total_lines')})"
+            lines = result["lines"]
+            header = f"# {result['filename']} L{result['from_line']}-L{result['to_line']} (total={result['total_lines']})"
+            if with_line_numbers:
+                body = _format_numbered_lines(lines, result["from_line"])
+            else:
+                body = _join_lines(lines)
+            return f"{header}\n{body}"
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def find_note_lines(filename: str, pattern: str, is_regex: bool = False,
+                        max_results: int = 50, context_lines: int = 0) -> str:
+        """ノート内で pattern にマッチする行を検索し、行番号を返す。
+
+        編集前に座標を取得する用途を想定。context_lines>0 で grep -C 相当の前後文脈付き。
+
+        Args:
+            filename: ノートのファイル名
+            pattern: 検索文字列（または is_regex=True なら正規表現）
+            is_regex: True で正規表現、False で部分文字列マッチ
+            max_results: 返すヒットの最大数
+            context_lines: ヒット行の前後 N 行を併記する
+
+        Returns:
+            行番号とテキスト（必要に応じて前後文脈）
+        """
+        try:
+            result = client.find_note_lines(filename, pattern, is_regex=is_regex,
+                                            max_results=max_results, context_lines=context_lines)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            hits = result["hits"]
+            if not hits:
+                return f"No matches for '{pattern}' in {filename} (total_lines={result['total_lines']})"
+            out = [f"# {filename}: {result['match_count']} hit(s) (total_lines={result['total_lines']})"]
+            for h in hits:
+                if context_lines > 0 and (h.get("before") or h.get("after")):
+                    for b in h.get("before", []):
+                        out.append("{:>5}  {}".format(b["line_number"], b["text"]))
+                    out.append("{:>5}> {}".format(h["line_number"], h["text"]))
+                    for a in h.get("after", []):
+                        out.append("{:>5}  {}".format(a["line_number"], a["text"]))
+                    out.append("--")
+                else:
+                    out.append("{:>5}: {}".format(h["line_number"], h["text"]))
+            return "\n".join(out)
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def search_notes_lines(query: str, is_regex: bool = False,
+                           max_files: int = 20, max_per_file: int = 20) -> str:
+        """複数ノートを横断して行単位で検索する（グローバル行検索）。
+
+        search_notes でヒットしたファイルを find_note_lines で行単位に絞り込み、
+        {filename, line_number, text} のフラットリストで返す。
+
+        Args:
+            query: 検索クエリ
+            is_regex: True で正規表現
+            max_files: 検索対象にする最大ファイル数
+            max_per_file: 1 ファイルあたりの最大ヒット数
+
+        Returns:
+            ヒット一覧（ファイル名・行番号・行テキスト）
+        """
+        try:
+            result = client.search_notes_lines(query, is_regex=is_regex,
+                                               max_files=max_files, max_per_file=max_per_file)
+            results = result["results"]
+            if not results:
+                return f"No line-level matches for '{query}'"
+            out = [f"{result['match_count']} line(s) in {result['file_count']} file(s):"]
+            for r in results:
+                out.append(f"[{r['filename']}] L{r['line_number']}: {r['text']}")
+            return "\n".join(out)
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def replace_note_lines(filename: str, from_line: int, to_line: int,
+                           content: str, dry_run: bool = False) -> str:
+        """指定した行範囲 [from_line..to_line] を content で置き換える。
+
+        - 1-indexed, 両端を含む
+        - content は複数行可（\\n 区切り）、空文字で削除と等価
+        - dry_run=True で PUT せずに編集プレビューだけ返す
+
+        Args:
+            filename: ノートのファイル名
+            from_line: 置換開始行（1-indexed）
+            to_line: 置換終了行（1-indexed, 両端含む）
+            content: 置き換え内容（複数行可）
+            dry_run: True で適用せずプレビューのみ
+        """
+        try:
+            result = client.replace_note_lines(filename, from_line, to_line, content, dry_run=dry_run)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            if dry_run:
+                return (f"[DRY-RUN] {filename}: L{result['from_line']}-L{result['to_line']} "
+                        f"({result['lines_removed']}行削除, {result['lines_inserted']}行挿入). "
+                        f"Total: {result['total_lines_before']} -> {result['total_lines_after']}\n"
+                        f"Preview:\n{result['preview']}")
+            return (f"Updated {filename}: replaced L{result['from_line']}-L{result['to_line']} "
+                    f"({result['lines_removed']} lines) with {result['lines_inserted']} new lines. "
+                    f"Total lines now: {result['total_lines_after']}.")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def insert_note_lines(filename: str, at_line: int, content: str, dry_run: bool = False) -> str:
+        """指定した行の直前に content を挿入する。
+
+        at_line = total_lines + 1 を指定すると末尾追記になる。
+        content は複数行可（\\n 区切り）。
+
+        Args:
+            filename: ノートのファイル名
+            at_line: 挿入位置（この行の直前に入る, 1-indexed）
+            content: 挿入内容
+            dry_run: True で適用せずプレビューのみ
+        """
+        try:
+            result = client.insert_note_lines(filename, at_line, content, dry_run=dry_run)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            if dry_run:
+                return (f"[DRY-RUN] {filename}: L{result['at_line']} に {result['lines_inserted']} 行挿入. "
+                        f"Total: {result['total_lines_before']} -> {result['total_lines_after']}\n"
+                        f"Preview:\n{result['preview']}")
+            return (f"Inserted {result['lines_inserted']} line(s) at L{result['at_line']} in {filename}. "
+                    f"Total lines now: {result['total_lines_after']}.")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def delete_note_lines(filename: str, from_line: int, to_line: int, dry_run: bool = False) -> str:
+        """指定した行範囲 [from_line..to_line] を削除する。1-indexed, 両端を含む。
+
+        Args:
+            filename: ノートのファイル名
+            from_line: 削除開始行
+            to_line: 削除終了行（両端含む, -1 で末尾まで）
+            dry_run: True で適用せずプレビューのみ
+        """
+        try:
+            result = client.delete_note_lines(filename, from_line, to_line, dry_run=dry_run)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            if dry_run:
+                return (f"[DRY-RUN] {filename}: L{result['from_line']}-L{result['to_line']} "
+                        f"({result['lines_removed']}行) を削除予定. "
+                        f"Total: {result['total_lines_before']} -> {result['total_lines_after']}\n"
+                        f"Preview:\n{result['preview']}")
+            return (f"Deleted L{result['from_line']}-L{result['to_line']} ({result['lines_removed']} lines) "
+                    f"from {filename}. Total lines now: {result['total_lines_after']}.")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def move_note_lines(filename: str, from_line: int, to_line: int,
+                        dest_line: int, dry_run: bool = False) -> str:
+        """行ブロック [from_line..to_line] を dest_line の直前に移動する。
+
+        delete+insert を AI 側で連続実行すると行番号がずれるため、それを回避する原子操作。
+        dest_line は **元の行番号** を指定すること（内部で座標補正する）。
+
+        Args:
+            filename: ノートのファイル名
+            from_line: 移動元ブロック開始行
+            to_line: 移動元ブロック終了行（両端含む）
+            dest_line: 移動先（この行の直前にブロックが入る）
+            dry_run: True で適用せずプレビューのみ
+        """
+        try:
+            result = client.move_note_lines(filename, from_line, to_line, dest_line, dry_run=dry_run)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            if dry_run:
+                return (f"[DRY-RUN] {filename}: L{result['from_line']}-L{result['to_line']} "
+                        f"({result['block_size']}行) を L{result['dest_line']} の直前に移動予定.\n"
+                        f"Preview:\n{result['preview']}")
+            return (f"Moved L{result['from_line']}-L{result['to_line']} ({result['block_size']} lines) "
+                    f"to before L{result['dest_line']} in {filename}. "
+                    f"Total lines: {result['total_lines_after']}.")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+    @mcp.tool()
+    def batch_edit_note(filename: str, operations: list, dry_run: bool = False) -> str:
+        """複数の行編集を 1 回の PUT で原子的に適用する（★最重要）。
+
+        行番号はすべて **元のメモの行番号** を基準に指定。内部で降順適用するので
+        クライアント側で番号ずれを考慮する必要は無い。1 件でもバリデーション失敗なら
+        メモは無変更で全体 reject される（原子性）。
+
+        operations の各要素（op の種類）:
+          {"op": "replace", "from_line": 10, "to_line": 12, "content": "new text"}
+          {"op": "insert",  "at_line": 20, "content": "new line"}
+          {"op": "delete",  "from_line": 30, "to_line": 30}
+          {"op": "move",    "from_line": 40, "to_line": 42, "dest_line": 5}
+
+        同じ行範囲に対して複数の replace/delete を掛けることはできない（重なりエラー）。
+        content は複数行可（\\n 区切り）。
+
+        Args:
+            filename: ノートのファイル名
+            operations: 上記の dict のリスト
+            dry_run: True で適用せずプレビューのみ
+        """
+        try:
+            result = client.batch_edit_note(filename, operations, dry_run=dry_run)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            prefix = "[DRY-RUN] " if dry_run else ""
+            return (f"{prefix}{filename}: {result['applied']} operations applied. "
+                    f"Total lines: {result['total_lines_before']} -> {result['total_lines_after']}.")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
