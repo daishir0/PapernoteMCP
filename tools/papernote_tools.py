@@ -1,4 +1,5 @@
 """Papernote tools implementation for MCP Server."""
+import io
 import re
 import requests
 from typing import Optional
@@ -6,6 +7,7 @@ from datetime import datetime
 from urllib.parse import quote
 from mcp.types import ImageContent, TextContent
 import base64
+from PIL import Image
 
 
 def _parse_note_sections(content: str) -> list[dict]:
@@ -1564,16 +1566,19 @@ def register_tools(mcp, config: dict):
 
     @mcp.tool()
     def get_attachment(path: str) -> list[TextContent | ImageContent]:
-        """Download an attachment (image) from Papernote and return it visually.
+        """Download an attachment file from Papernote and return its raw data.
 
-        Use list_attachments first to find available paths, then pass a path here.
-        Returns the image so Claude.ai can see and analyze it directly.
+        Returns the original file without any modification.
+        For images, this returns the full-resolution original — which may be very large
+        and exceed token limits. To just VIEW an image, use view_attachment instead.
+
+        Use list_attachments first to find available paths.
 
         Args:
             path: Attachment path (e.g., /attach/abc123.png)
 
         Returns:
-            The image content (displayed visually in Claude.ai)
+            The raw file content (image as ImageContent, SVG/text as TextContent)
         """
         try:
             binary_data, content_type = client.download_attachment(path)
@@ -1590,6 +1595,76 @@ def register_tools(mcp, config: dict):
             )]
         except requests.exceptions.RequestException as e:
             return [TextContent(type="text", text=f"Error downloading attachment: {str(e)}")]
+
+    @mcp.tool()
+    def view_attachment(path: str, max_size: int = 1024) -> list[TextContent | ImageContent]:
+        """View an attachment image from Papernote, auto-resized for optimal display.
+
+        Best tool for LOOKING AT images — automatically resizes large images to fit
+        within token limits while preserving visual quality.
+        For non-image files or when you need the original full-resolution data,
+        use get_attachment instead.
+
+        Use list_attachments first to find available paths.
+
+        Args:
+            path: Attachment path (e.g., /attach/abc123.png)
+            max_size: Maximum pixel size for the longest edge (default: 1024)
+
+        Returns:
+            The optimized image (displayed visually) or guidance for non-image files
+        """
+        try:
+            binary_data, content_type = client.download_attachment(path)
+
+            # SVG: return as text (no resize needed)
+            if content_type == 'image/svg+xml':
+                return [TextContent(
+                    type="text",
+                    text=f"SVG content:\n```xml\n{binary_data.decode('utf-8')}\n```"
+                )]
+
+            # Non-image files: guide to use get_attachment
+            if not content_type.startswith('image/'):
+                return [TextContent(
+                    type="text",
+                    text=f"This file is not an image (type: {content_type}). Use get_attachment to retrieve it."
+                )]
+
+            # Image: resize with Pillow
+            img = Image.open(io.BytesIO(binary_data))
+            w, h = img.size
+            longest = max(w, h)
+
+            if longest > max_size:
+                ratio = max_size / longest
+                new_w = int(w * ratio)
+                new_h = int(h * ratio)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+
+            # Convert to JPEG for smaller output (handle RGBA/palette)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1])
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=85)
+            b64_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+            return [ImageContent(
+                type="image",
+                data=b64_data,
+                mimeType="image/jpeg"
+            )]
+        except requests.exceptions.RequestException as e:
+            return [TextContent(type="text", text=f"Error downloading attachment: {str(e)}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error processing image: {str(e)}")]
 
     # --- Phase: 行ベースランダムアクセス/編集ツール ---
 
